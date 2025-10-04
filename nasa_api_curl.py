@@ -3,6 +3,8 @@ import json
 import os
 from datetime import datetime, timedelta
 import xarray as xr
+from tqdm import tqdm
+from urllib.parse import urlparse, unquote
 
 try:
     import earthaccess
@@ -12,12 +14,26 @@ except ImportError:
     print("Warning: earthaccess not installed. Download functionality will be limited.")
     print("Install with: pip install earthaccess")
 
+# --- DOTENV IMPORT FOR CREDENTIAL LOADING ---
+try:
+    from dotenv import load_dotenv, find_dotenv
+    DOTENV_AVAILABLE = True
+except ImportError:
+    DOTENV_AVAILABLE = False
+# --------------------------------------------
+
+# --- DIRECTORY STRUCTURE DEFINITIONS ---
+BASE_DATA_DIR = './data'
+RESULTS_DIR = os.path.join(BASE_DATA_DIR, 'results')
+DOWNLOADS_BASE_DIR = os.path.join(BASE_DATA_DIR, 'results_downloads')
+# ----------------------------------------
+
 # Seattle bounding box coordinates
 SEATTLE_BBOX = {
-    'west': -122.4,
-    'south': 47.4,
-    'east': -122.2,
-    'north': 47.7
+    'west': -123.0,
+    'south': 47.0,
+    'east': -122.0,
+    'north': 48.0
 }
 
 # NASA CMR API endpoints
@@ -50,35 +66,6 @@ NOAA-20 & Suomi NPP VIIRS (2017 & 2011-present)
   • Similar to NOAA-21 but with longer historical records
   • Good for trend analysis over time
   ✓ Best for: Long-term pollution trends
-
-🌡️  THERMAL/HEAT DATA (for urban heat islands - NOT in this script):
-
-For asphalt heat maps, you need THERMAL INFRARED data:
-
-Landsat 8/9 - Thermal Infrared Sensor (TIRS)
-  • Land Surface Temperature (LST)
-  • Urban heat island mapping
-  • Hot spots from roads, parking lots, roofs
-  • 100m resolution - good for neighborhoods
-  
-ECOSTRESS (on ISS)
-  • Very high resolution thermal (70m)
-  • Surface temperature of buildings, streets
-  • Urban heat stress indicators
-  
-MODIS Terra/Aqua - Thermal bands
-  • Daily global temperature
-  • 1km resolution - city-wide patterns
-  
-ASTER
-  • 90m thermal resolution
-  • Good for detailed urban thermal mapping
-
-📊 RECOMMENDED DATA PIPELINE FOR URBAN HEALTH:
-
-1. AIR POLLUTION: Use this script → PACE OCI or NOAA-21 VIIRS aerosol data
-2. HEAT MAPS: Need separate search for Landsat or ECOSTRESS thermal data
-3. COMBINATION: Overlay pollution + heat for comprehensive health risk maps
 """)
     print("="*80)
 
@@ -133,16 +120,40 @@ def search_aerosol_collections():
             seen_names.add(short_name)
             unique_collections.append(col)
     
-    print(f"\n{'='*80}")
-    print(f"Found {len(unique_collections)} unique aerosol collections")
-    print("="*80)
-    
     return unique_collections
 
+def filter_collections(collections):
+    """Filters collections to only include L3 products and relevant aerosol products."""
+    print("Applying filters: L3 + Aerosol (AER/AOD/AE) - Ocean Color (OC/CHL/CARBON)")
+    filtered = []
+    for col in collections:
+        short_name = col.get('short_name', '').upper()
+        
+        # 1. Filter for L3
+        is_l3 = 'L3' in short_name
+        
+        # 2. Filter for "Good" aerosol product (AER/AOD/AE)
+        is_aerosol = any(term in short_name for term in ['AER', 'AOD', 'AE'])
+        
+        # 3. Filter out "Bad" ocean color products (OC/CHL/CARBON)
+        is_ocean_color = any(term in short_name for term in ['OC', 'CHL', 'CARBON'])
+        
+        if is_l3 and is_aerosol and not is_ocean_color:
+            filtered.append(col)
+            
+    print(f"  ✓ Filtered down to {len(filtered)} relevant collections.")
+    return filtered
+
 def display_collections_paginated(collections, page_size=25):
-    """Display collections with pagination"""
+    """Display collections with pagination."""
     total = len(collections)
     start = 0
+    
+    print("\n" + "#"*80)
+    print("## ✅ FILTERED L3 AEROSOL COLLECTIONS")
+    print("#"*80)
+    print(f"Showing {total} collections. These are filtered for **Level 3 (L3)** and **Aerosol** data.")
+    print("---")
     
     while start < total:
         end = min(start + page_size, total)
@@ -158,8 +169,8 @@ def display_collections_paginated(collections, page_size=25):
             summary = collection.get('summary', 'No description')[:100]
             
             print(f"\n{i + 1}. [{platform}] {title}")
-            print(f"   Short Name: {short_name}")
-            print(f"   Description: {summary}...")
+            print(f"  Short Name: **{short_name}**")
+            print(f"  Description: {summary}...")
         
         start = end
         
@@ -230,7 +241,7 @@ def display_granule_info(granules):
         size_mb = None
         for link in granule.get('links', []):
             if 'inherited' in link and link['inherited'] == False:
-                size_mb = link.get('length', 0) / (1024 * 1024)  # Convert to MB
+                size_mb = link.get('length', 0) / (1024 * 1024) # Convert to MB
                 break
         
         # Get download links
@@ -248,83 +259,80 @@ def display_granule_info(granules):
         granule_list.append(granule_info)
         
         print(f"\n{i}. {title}")
-        print(f"   Time: {time_start}")
-        print(f"   Granule ID: {granule_id}")
+        print(f"  Time: {time_start}")
         if size_mb:
-            print(f"   Size: {size_mb:.2f} MB")
+            print(f"  Size: {size_mb:.2f} MB")
         if download_links:
-            print(f"   Download URL: {download_links[0][:80]}...")
+            print(f"  Download URL: {download_links[0][:80]}...")
     
     return granule_list
 
+def get_granule_id_from_url(file_path):
+    """Extracts the granule ID from the downloaded file path for logging."""
+    return os.path.basename(file_path)
+
 def check_file_contents(file_path):
     """Check if NetCDF file has actual data (not a placeholder)"""
-    print(f"\nChecking file contents: {os.path.basename(file_path)}")
+    file_id = get_granule_id_from_url(file_path)
+    print(f"\nChecking file: **{file_id}**")
     
     try:
-        ds = xr.open_dataset(file_path)
+        # Use decode_times=False to avoid time parsing errors in large datasets
+        ds = xr.open_dataset(file_path, decode_times=False)
         
         num_vars = len(ds.data_vars)
-        num_coords = len(ds.coords)
         
-        print(f"  ✓ Variables found: {num_vars}")
-        print(f"  ✓ Coordinates found: {num_coords}")
-        
+        # Check for the Ocean Color signature: no data variables over land
         if num_vars == 0:
-            print(f"  ✗ WARNING: File has no data variables (likely placeholder/empty)")
+            print("  ❌ WARNING: File has **zero** data variables. This confirms it's a **placeholder**.")
+            print("  Reason: Likely an **Ocean Color (OC)** product filtered over land.")
             ds.close()
             return False
-        
-        # Show first few variables
-        if num_vars > 0:
-            print(f"  ✓ Sample variables:")
-            for i, var in enumerate(list(ds.data_vars)[:5]):
-                print(f"    - {var}: {ds[var].shape}")
-        
-        ds.close()
-        return True
-        
-    except Exception as e:
-        print(f"  ✗ Error reading file: {e}")
-        return False
-
-def login_earthaccess():
-    """Login to NASA Earthdata"""
-    if not EARTHACCESS_AVAILABLE:
-        print("\nError: earthaccess library not installed")
-        print("Install with: pip install earthaccess")
-        return False
-    
-    try:
-        print("\nLogging in to NASA Earthdata...")
-        print("(First time will prompt for username/password)")
-        auth = earthaccess.login()
-        
-        if auth.authenticated:
-            print("✓ Successfully authenticated!")
-            return True
-        else:
-            print("✗ Authentication failed")
-            return False
             
+        print(f"  ✅ Variables found: {num_vars}")
+        
+        # Check if the primary variable is empty (e.g., all NaNs or size 1)
+        is_valid = False
+        for var_name in ds.data_vars:
+            # Skip coordinate variables if they sneak into data_vars
+            if var_name in ds.coords:
+                continue
+            
+            # Check if the variable size is greater than 1 (to filter out scalar variables)
+            if ds[var_name].size > 1:
+                is_valid = True
+                print(f"  - Primary variable **{var_name}** with shape {ds[var_name].shape} found.")
+                break # Found a valid variable, no need to check others
+
+        ds.close()
+        return is_valid
+        
     except Exception as e:
-        print(f"✗ Login error: {e}")
+        print(f"  ❌ ERROR: Could not read file content. Check file integrity.")
+        print(f"  Error details: {e}")
         return False
 
-def download_granules(granule_ids, output_dir='./data'):
-    """Download granules and check their contents"""
+def download_granules(granule_ids, output_dir):
+    """
+    Download granules, check their contents, and save to a timestamped directory.
+    
+    Args:
+        granule_ids (list): List of CMR concept IDs for the granules to download.
+        output_dir (str): The full path to the timestamped directory to save files in.
+        
+    Returns:
+        list: A list of file paths for valid (non-placeholder) downloaded files.
+    """
     if not EARTHACCESS_AVAILABLE:
         print("\nError: earthaccess library not installed")
         return []
     
-    # Create output directory
+    # Create the timestamped output directory
     os.makedirs(output_dir, exist_ok=True)
     
-    print(f"\nDownloading {len(granule_ids)} granule(s) to {output_dir}...")
-    print("Searching for granule data...")
+    print(f"\nDownloading {len(granule_ids)} granule(s) to **{output_dir}**...")
     
     try:
-        # First, search for the granules to get the actual granule objects
         granule_results = earthaccess.search_data(
             concept_id=granule_ids
         )
@@ -334,21 +342,36 @@ def download_granules(granule_ids, output_dir='./data'):
             return []
         
         print(f"Found {len(granule_results)} granule(s) available for download")
+        print("\nPress Ctrl+C at any time to stop downloading and check files downloaded so far.\n")
         
-        # Download files
-        files = earthaccess.download(
-            granule_results,
-            local_path=output_dir
-        )
+        # Download files with progress bar
+        files = []
+        try:
+            with tqdm(total=len(granule_results), desc="Downloading", unit="file") as pbar:
+                for granule in granule_results:
+                    try:
+                        downloaded = earthaccess.download(
+                            granule,
+                            local_path=output_dir
+                        )
+                        if downloaded:
+                            files.extend(downloaded if isinstance(downloaded, list) else [downloaded])
+                        pbar.update(1)
+                    except Exception as e:
+                        pbar.write(f"✗ Error downloading {granule.get('producer_granule_id', 'unknown')}: {e}")
+                        pbar.update(1)
+        except KeyboardInterrupt:
+            print("\n\n⚠️  Download cancelled by user!")
+            print(f"Downloaded {len(files)} file(s) before cancellation.")
         
-        print(f"\n✓ Downloaded {len(files)} file(s)")
+        print(f"\n✓ Downloaded {len(files)} file(s) total")
         
         # Check each file
         valid_files = []
         empty_files = []
         
         print("\n" + "="*80)
-        print("CHECKING FILE CONTENTS:")
+        print("CHECKING FILE CONTENTS (Data Validation):")
         print("="*80)
         
         for file_path in files:
@@ -365,20 +388,170 @@ def download_granules(granule_ids, output_dir='./data'):
         print(f"Empty/placeholder files: {len(empty_files)}")
         
         if valid_files:
-            print("\n✓ Valid files:")
-            for f in valid_files:
-                print(f"  - {f}")
+            print(f"\n✓ Valid files saved to: {output_dir}")
         
         if empty_files:
             print("\n✗ Empty files (you may want to delete these):")
             for f in empty_files:
                 print(f"  - {f}")
+            print("\n**Action:** If you see many empty files, try selecting a different **Aerosol** collection.")
         
         return valid_files
         
     except Exception as e:
         print(f"\n✗ Download error: {e}")
         return []
+        
+def login_earthaccess():
+    """
+    Login to NASA Earthdata, attempting to load credentials from .env first, 
+    then prompting the user if necessary.
+    """
+    if not EARTHACCESS_AVAILABLE:
+        print("\nError: earthaccess library not installed")
+        return False
+    
+    # --- START OF DOTENV LOGIC ---
+    if DOTENV_AVAILABLE:
+        # Load environment variables from .env file
+        dotenv_path = find_dotenv('.env') 
+        if dotenv_path:
+            print(f"\nAttempting to load credentials from .env file: {dotenv_path}")
+            load_dotenv(dotenv_path)
+            
+            # Check if env vars were set
+            if os.environ.get('EARTHDATA_USERNAME') and os.environ.get('EARTHDATA_PASSWORD'):
+                print("✓ Credentials successfully loaded from .env. Attempting silent login.")
+            else:
+                print("⚠️ .env file found, but required variables (EARTHDATA_USERNAME, EARTHDATA_PASSWORD) not set. Falling back to prompt.")
+        else:
+            print("\n.env file not found. Falling back to saved credentials or manual prompt.")
+    else:
+        print("\nNote: Install 'pip install python-dotenv' to enable automatic credential loading from a .env file.")
+    # --- END OF DOTENV LOGIC ---
+
+    max_attempts = 3
+    attempt = 0
+    
+    while attempt < max_attempts:
+        try:
+            attempt += 1
+            
+            if attempt == 1:
+                # earthaccess.login() will check the environment first
+                print("\nLogging in to NASA Earthdata...")
+                # Only show prompt message if credentials weren't already loaded
+                if not (os.environ.get('EARTHDATA_USERNAME') and os.environ.get('EARTHDATA_PASSWORD')):
+                    print("(If this is the first time or if .env failed, it will prompt for username/password)")
+            else:
+                print(f"\n✗ Login failed. Attempt {attempt} of {max_attempts}")
+                print("Please check your credentials and try again.")
+            
+            auth = earthaccess.login()
+            
+            if auth.authenticated:
+                print("✓ Successfully authenticated!")
+                return True
+            else:
+                print("✗ Authentication failed")
+                if attempt < max_attempts:
+                    retry = input("\nWould you like to try again? (y/n): ").lower()
+                    if retry != 'y':
+                        return False
+                
+        except Exception as e:
+            error_msg = str(e)
+            print(f"✗ Login error: {error_msg}")
+            
+            if "invalid_credentials" in error_msg.lower() or "authentication" in error_msg.lower():
+                if attempt < max_attempts:
+                    print("\nTip: Make sure you're using your Earthdata Login credentials from:")
+                    print("https://urs.earthdata.nasa.gov/")
+                    retry = input("\nWould you like to try again? (y/n): ").lower()
+                    if retry != 'y':
+                        return False
+                else:
+                    print(f"\nMaximum login attempts ({max_attempts}) reached.")
+                    return False
+            else:
+                print(f"\nUnexpected error during login.")
+                return False
+    
+    print(f"\nMaximum login attempts ({max_attempts}) reached.")
+    print("Please verify your credentials at: https://urs.earthdata.nasa.gov/")
+    return False
+
+def parse_granule_selection(input_str, max_index):
+    """
+    Parses a string of indices and ranges (e.g., '1,3,5-7') into a set of unique integers.
+    """
+    selected_indices = set()
+    parts = [part.strip() for part in input_str.split(',')]
+    
+    for part in parts:
+        if '-' in part:
+            # Handle range (e.g., 5-7)
+            try:
+                start, end = map(int, part.split('-'))
+                if start > end:
+                    start, end = end, start # Handle backward ranges like 7-5
+                
+                # Check for bounds and add indices (1-based)
+                for i in range(start, end + 1):
+                    if 1 <= i <= max_index:
+                        selected_indices.add(i)
+            except ValueError:
+                # Ignore invalid range parts
+                continue
+        else:
+            # Handle single index (e.g., 3)
+            try:
+                index = int(part)
+                # Check for bounds and add index (1-based)
+                if 1 <= index <= max_index:
+                    selected_indices.add(index)
+            except ValueError:
+                # Ignore invalid single index parts
+                continue
+                
+    # Return as a sorted list
+    return sorted(list(selected_indices))
+
+def get_valid_main_choice(prompt, max_options):
+    """
+    Gets a valid integer choice from the user, or 'q'. Loops until valid.
+    Returns: integer (choice) or string ('q')
+    """
+    while True:
+        choice = input(prompt).strip()
+        if choice.lower() == 'q':
+            return 'q'
+        
+        try:
+            idx = int(choice) - 1 # Convert to 0-based index
+            if 0 <= idx < max_options:
+                return int(choice)
+            else:
+                print(f"Invalid selection. Please enter a number between 1 and {max_options}, or 'q' to quit.")
+        except ValueError:
+            print("Invalid input. Please enter a valid number or 'q'.")
+
+def get_valid_download_choice():
+    """
+    Gets a valid choice (1, 2, or 3) for the download option. Loops until valid.
+    Returns: string ('1', '2', or '3')
+    """
+    while True:
+        print("\nOptions:")
+        print("1. Download all granules")
+        print("2. Download specific granules (e.g., 1,3,5-10)")
+        print("3. Skip download")
+        
+        choice = input("\nEnter choice (1-3): ").strip()
+        if choice in ['1', '2', '3']:
+            return choice
+        else:
+            print("Invalid choice. Please enter 1, 2, or 3.")
 
 def main():
     print("="*80)
@@ -398,118 +571,165 @@ def main():
         print("\nNo collections found. Try searching manually at:")
         print("https://search.earthdata.nasa.gov/search?q=NOAA-21%20VIIRS%20aerosol")
         return
+        
+    # Apply Filtering
+    collections = filter_collections(collections)
     
-    # Display collections with pagination
-    display_collections_paginated(collections, page_size=25)
-    
-    # Let user select a collection
-    print("\n" + "="*80)
-    choice = input("\nEnter collection number to search for data (or 'q' to quit): ")
-    
-    if choice.lower() == 'q':
+    if not collections:
+        print("\n" + "="*80)
+        print("No valid L3 Aerosol collections found after filtering. Please check the search terms.")
+        print("Exiting.")
+        print("="*80)
         return
+
+    granules = []
     
-    try:
-        idx = int(choice) - 1
-        if idx < 0 or idx >= len(collections):
-            print("Invalid selection")
-            return
+    # --- Main loop for collection selection and granule search with validation ---
+    while True:
+        # Display collections with pagination and guidance
+        display_collections_paginated(collections, page_size=25)
         
-        selected = collections[idx]
-        short_name = selected.get('short_name')
+        # Get validated choice
+        choice = get_valid_main_choice(
+            f"\nEnter **Aerosol L3** collection number (1-{len(collections)}) to search for data (or 'q' to quit): ", 
+            len(collections)
+        )
         
-        print(f"\nSelected: {selected.get('title')}")
+        if choice == 'q':
+            break 
         
-        # Get date range
-        print("\nEnter date range (leave blank for last 7 days):")
-        start_input = input("Start date (YYYY-MM-DD): ").strip()
-        end_input = input("End date (YYYY-MM-DD): ").strip()
-        
-        start_date = None
-        end_date = None
-        
-        if start_input:
-            start_date = datetime.strptime(start_input, '%Y-%m-%d')
-        if end_input:
-            end_date = datetime.strptime(end_input, '%Y-%m-%d')
-        
-        # Search for granules
-        granules = search_granules(short_name, start_date, end_date)
-        
-        # Display results
-        granule_list = display_granule_info(granules)
-        
-        # Save results to JSON
-        if granules:
-            output_file = f"aerosol_granules_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            with open(output_file, 'w') as f:
-                json.dump(granules, f, indent=2)
-            print(f"\n✓ Full results saved to: {output_file}")
-        
-        # Download option
-        if granule_list and EARTHACCESS_AVAILABLE:
-            print("\n" + "="*80)
-            download_choice = input("\nWould you like to download files? (y/n): ").lower()
+        try:
+            # choice is guaranteed to be a valid integer index (1-based)
+            idx = choice - 1
+            selected = collections[idx]
+            short_name = selected.get('short_name')
             
-            if download_choice == 'y':
-                # Login first
-                if not login_earthaccess():
-                    print("\nCannot download without authentication.")
-                    return
-                
-                # Select granules to download
-                print("\nOptions:")
-                print("1. Download all granules")
-                print("2. Download specific granules")
-                print("3. Skip download")
-                
-                choice = input("\nEnter choice (1-3): ").strip()
-                
-                selected_granules = []
-                
-                if choice == '1':
-                    selected_granules = [g['id'] for g in granule_list]
-                elif choice == '2':
-                    indices = input("Enter granule numbers (comma-separated, e.g., 1,3,5): ")
-                    try:
-                        selected_indices = [int(i.strip()) for i in indices.split(',')]
-                        selected_granules = [granule_list[i-1]['id'] for i in selected_indices 
-                                           if 0 < i <= len(granule_list)]
-                    except (ValueError, IndexError):
-                        print("Invalid selection")
-                        return
-                elif choice == '3':
-                    print("Skipping download.")
-                    return
-                
-                if selected_granules:
-                    output_dir = input("\nOutput directory (default: ./data): ").strip() or './data'
-                    valid_files = download_granules(selected_granules, output_dir)
-                    
-                    if valid_files:
-                        print(f"\n✓ Successfully downloaded {len(valid_files)} valid file(s)!")
-                        print(f"\nYou can now use the NetCDF reader script to explore these files.")
+            print(f"\nSelected: {selected.get('title')}")
+            
+            # Get date range (No validation loop here, simple input for now)
+            print("\nEnter date range (leave blank for last 7 days):")
+            start_input = input("Start date (YYYY-MM-DD): ").strip()
+            end_input = input("End date (YYYY-MM-DD): ").strip()
+            
+            start_date = None
+            end_date = None
+            
+            if start_input:
+                try:
+                    start_date = datetime.strptime(start_input, '%Y-%m-%d')
+                except ValueError:
+                    print("Invalid date format. Using default range.")
+            if end_input:
+                try:
+                    end_date = datetime.strptime(end_input, '%Y-%m-%d')
+                except ValueError:
+                    print("Invalid date format. Using default range.")
+
+            # Search for granules
+            granules = search_granules(short_name, start_date, end_date)
+            
+            if not granules:
+                print("\n" + "="*80)
+                print("⚠️ No granules found for the selected collection and date range.")
+                print("Returning to collection selection to try a different collection or date range.")
+                print("="*80)
+                continue # Loop continues
+            
+            # Granules found, break the loop
+            break 
+            
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}. Returning to collection selection.")
+            continue
+            
+    # Check if the loop was broken by the user quitting
+    if choice == 'q' or not granules:
+        print("\nSearch operation ended.")
+        return 
+
+    # --- SUCCESSFUL GRANULE LOGIC STARTS HERE ---
+    
+    # Display results
+    granule_list = display_granule_info(granules)
+    
+    # Save results to data/results
+    if granules:
+        os.makedirs(RESULTS_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_file = os.path.join(RESULTS_DIR, f"aerosol_granules_{timestamp}.json")
         
-        elif not EARTHACCESS_AVAILABLE:
-            print("\n" + "="*80)
-            print("DOWNLOAD INSTRUCTIONS:")
-            print("="*80)
-            print("""
+        with open(output_file, 'w') as f:
+            json.dump(granules, f, indent=2)
+        print(f"\n✓ Full results saved to: **{output_file}**")
+    
+    # Download option
+    if granule_list and EARTHACCESS_AVAILABLE:
+        print("\n" + "="*80)
+        download_choice = input("\nWould you like to download files? (y/n): ").lower()
+        
+        if download_choice == 'y':
+            if not login_earthaccess():
+                print("\nCannot download without authentication.")
+                return
+            
+            # Get validated download choice (1, 2, or 3)
+            choice = get_valid_download_choice()
+            
+            selected_granules_ids = []
+            
+            if choice == '1':
+                selected_granules_ids = [g['id'] for g in granule_list]
+            elif choice == '2':
+                # --- START OF RANGE/LIST PROCESSING WITH VALIDATION ---
+                max_granules = len(granule_list)
+                print(f"Total granules available: {max_granules}")
+                
+                while True:
+                    indices_input = input("Enter granule numbers (comma-separated or range, e.g., 1,3,5-10): ").strip()
+                    selected_indices_1based = parse_granule_selection(indices_input, max_granules)
+                    
+                    if not selected_indices_1based:
+                        print(f"Invalid or empty selection. Please enter valid numbers/ranges between 1 and {max_granules}.")
+                        continue
+                    else:
+                        break
+                
+                # Convert 1-based indices back to 0-based and fetch the corresponding IDs
+                for i in selected_indices_1based:
+                    selected_granules_ids.append(granule_list[i-1]['id'])
+                # --- END OF RANGE/LIST PROCESSING ---
+            elif choice == '3':
+                print("Skipping download.")
+                return
+            
+            if selected_granules_ids:
+                # Create timestamped downloads directory
+                download_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                downloads_target_dir = os.path.join(DOWNLOADS_BASE_DIR, download_timestamp)
+                
+                print(f"\nDownloads will be saved to: **{downloads_target_dir}**")
+
+                valid_files = download_granules(selected_granules_ids, downloads_target_dir)
+                
+                if valid_files:
+                    print(f"\n✓ Successfully downloaded {len(valid_files)} valid file(s)!")
+                    print(f"\nYou can now use the NetCDF reader script to explore files in: **{downloads_target_dir}**")
+    
+    elif not EARTHACCESS_AVAILABLE:
+        print("\n" + "="*80)
+        print("DOWNLOAD INSTRUCTIONS:")
+        print("="*80)
+        print("""
 earthaccess not installed. To enable downloading:
 
 1. Install earthaccess:
-   pip install earthaccess
+    pip install earthaccess
 
 2. Create a NASA Earthdata account:
-   https://urs.earthdata.nasa.gov/users/new
+    https://urs.earthdata.nasa.gov/users/new
 
 3. Run this script again to download files automatically.
 """)
-        
-    except ValueError:
-        print("Invalid input")
-    except Exception as e:
-        print(f"Error: {e}")
 
 if __name__ == "__main__":
     main()
