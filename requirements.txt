@@ -1,0 +1,4 @@
+xarray
+pandas
+netcdf4
+h5netcdf
