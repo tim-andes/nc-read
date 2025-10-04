@@ -1,0 +1,73 @@
+# Satellite data files
+*.nc
+*.hdf
+*.h5
+*.he5
+*.hdf5
+
+# Data directories
+data/
+downloads/
+satellite_data/
+output/
+results/
+
+# Exported data files
+*.csv
+*.parquet
+*.tif
+*.geotiff
+*.json
+
+# Except configuration JSON files (keep these)
+!config.json
+!settings.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+.env
+
+# Virtual environments
+*.egg-info/
+dist/
+build/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+*.log
+
+# NASA Earthdata credentials (if stored locally)
+.netrc
+.earthdata_auth
+
+# Temporary files
+*.tmp
+temp/
+tmp/
+
+# Large archive files
+*.zip
+*.tar
+*.gz
+*.tar.gz
+*.rar
